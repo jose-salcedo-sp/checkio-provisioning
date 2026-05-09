@@ -571,6 +571,9 @@ fn create_directories(
         fs::create_dir_all(state_parent)?;
     }
 
+    // tenants_root (/var/checkio) must be world-traversable so nginx can reach public/
+    set_dir_mode(&cli.tenants_root, 0o755)?;
+
     run_chown(
         &runtime.tenant_dir,
         &format!("{}:{}", cli.service_user, cli.service_user),
@@ -783,6 +786,12 @@ fn deploy_frontend(
     }
 
     copy_dir_all(dist, &runtime.public_dir)?;
+    run_chown(
+        &runtime.public_dir,
+        &format!("{}:{}", cli.service_user, cli.service_user),
+        "chown_public_dir",
+        steps,
+    )?;
 
     steps.push(StepStatus {
         name: "deploy_frontend".to_string(),
