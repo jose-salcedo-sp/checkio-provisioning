@@ -577,7 +577,7 @@ fn create_directories(
         "chown_tenant_dir",
         steps,
     )?;
-    set_dir_mode(&runtime.tenant_dir, 0o750)?;
+    set_dir_mode(&runtime.tenant_dir, 0o751)?;
     steps.push(StepStatus {
         name: "create_directories".to_string(),
         status: "ok".to_string(),
