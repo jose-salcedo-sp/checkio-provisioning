@@ -82,6 +82,12 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     skip_certbot: bool,
+
+    /// Path to a pre-built frontend dist/ directory. When provided, static
+    /// files are copied to the tenant's public dir and nginx is configured
+    /// to serve them at / and proxy /api/ to the backend.
+    #[arg(long)]
+    frontend_dist: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -140,6 +146,7 @@ struct RuntimeContext {
     client_origin: String,
     service_name: String,
     tenant_dir: PathBuf,
+    public_dir: PathBuf,
     env_file: PathBuf,
     nginx_file: PathBuf,
     nginx_enabled_symlink: PathBuf,
@@ -222,6 +229,8 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
     let database_url = format!("sqlite:{}", database_path.display());
     let service_name = format!("{}{}", cli.systemd_unit_prefix, cli.tenant);
 
+    let public_dir = tenant_dir.join("public");
+
     let runtime = RuntimeContext {
         tenant: cli.tenant.clone(),
         domain: domain.clone(),
@@ -230,6 +239,7 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         client_origin,
         service_name: service_name.clone(),
         tenant_dir: tenant_dir.clone(),
+        public_dir,
         env_file: env_file.clone(),
         nginx_file: nginx_file.clone(),
         nginx_enabled_symlink: nginx_enabled_symlink.clone(),
@@ -279,7 +289,10 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
             steps,
         )?;
 
-        let nginx_config = render_nginx_config(&runtime);
+        deploy_frontend(&cli, &runtime, steps)?;
+
+        let has_frontend = cli.frontend_dist.is_some();
+        let nginx_config = render_nginx_config(&runtime, has_frontend);
         allow_rollback = true;
         nginx_backups.push(atomic_write_with_backup(
             &runtime.nginx_file,
@@ -665,10 +678,42 @@ fn render_env_file(cli: &Cli, runtime: &RuntimeContext) -> String {
     )
 }
 
-fn render_nginx_config(runtime: &RuntimeContext) -> String {
+fn render_nginx_config(runtime: &RuntimeContext, has_frontend: bool) -> String {
     let upstream = format!("checkio_{}", runtime.tenant.replace('-', "_"));
-    format!(
-        "upstream {upstream} {{
+    if has_frontend {
+        format!(
+            "upstream {upstream} {{
+    server 127.0.0.1:{port};
+}}
+
+server {{
+    listen 80;
+    server_name {domain};
+
+    root {public_dir};
+    index index.html;
+
+    location /api/ {{
+        proxy_pass http://{upstream};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+
+    location / {{
+        try_files $uri $uri/ /index.html;
+    }}
+}}
+",
+            upstream = upstream,
+            port = runtime.port,
+            domain = runtime.domain,
+            public_dir = runtime.public_dir.display(),
+        )
+    } else {
+        format!(
+            "upstream {upstream} {{
     server 127.0.0.1:{port};
 }}
 
@@ -685,10 +730,70 @@ server {{
     }}
 }}
 ",
-        upstream = upstream,
-        port = runtime.port,
-        domain = runtime.domain
-    )
+            upstream = upstream,
+            port = runtime.port,
+            domain = runtime.domain,
+        )
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), ProvisionError> {
+    fs::create_dir_all(dst)?;
+    set_dir_mode(dst, 0o755)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+            set_file_mode(&dst_path, 0o644)?;
+        }
+    }
+    Ok(())
+}
+
+fn deploy_frontend(
+    cli: &Cli,
+    runtime: &RuntimeContext,
+    steps: &mut Vec<StepStatus>,
+) -> Result<(), ProvisionError> {
+    let dist = match &cli.frontend_dist {
+        Some(p) => p,
+        None => {
+            steps.push(StepStatus {
+                name: "deploy_frontend".to_string(),
+                status: "skipped".to_string(),
+                detail: "--frontend-dist not provided".to_string(),
+            });
+            return Ok(());
+        }
+    };
+
+    if !dist.exists() {
+        return Err(ProvisionError::Message(format!(
+            "frontend dist directory not found: {}",
+            dist.display()
+        )));
+    }
+
+    if runtime.public_dir.exists() {
+        fs::remove_dir_all(&runtime.public_dir)?;
+    }
+
+    copy_dir_all(dist, &runtime.public_dir)?;
+
+    steps.push(StepStatus {
+        name: "deploy_frontend".to_string(),
+        status: "ok".to_string(),
+        detail: format!(
+            "{} -> {}",
+            dist.display(),
+            runtime.public_dir.display()
+        ),
+    });
+    Ok(())
 }
 
 fn ensure_symlink(target: &Path, link: &Path) -> Result<SymlinkBackup, ProvisionError> {
