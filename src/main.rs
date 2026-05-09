@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -65,6 +65,9 @@ struct Cli {
     #[arg(long, default_value = "checkio@")]
     systemd_unit_prefix: String,
 
+    #[arg(long, value_enum, default_value_t = ServiceEnableMode::Runtime)]
+    service_enable_mode: ServiceEnableMode,
+
     #[arg(long, default_value = "sqlx")]
     sqlx_bin: String,
 
@@ -79,6 +82,13 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     skip_certbot: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ServiceEnableMode {
+    None,
+    Runtime,
+    Persistent,
 }
 
 #[derive(Debug, Error)]
@@ -227,6 +237,7 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
 
     let mut file_backups: Vec<FileBackup> = Vec::new();
     let mut symlink_backup: Option<SymlinkBackup> = None;
+    let mut allow_rollback = false;
 
     let provision_result = (|| -> Result<(), ProvisionError> {
         create_directories(&cli, &runtime, steps)?;
@@ -258,13 +269,7 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
             "systemd_daemon_reload",
             steps,
         )?;
-        run_command(
-            "systemctl",
-            &["enable", &runtime.service_name],
-            None,
-            "enable_service",
-            steps,
-        )?;
+        enable_service(&cli, &runtime, steps)?;
         run_command(
             "systemctl",
             &["restart", &runtime.service_name],
@@ -274,6 +279,7 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         )?;
 
         let nginx_config = render_nginx_config(&runtime);
+        allow_rollback = true;
         file_backups.push(atomic_write_with_backup(
             &runtime.nginx_file,
             nginx_config.as_bytes(),
@@ -335,17 +341,25 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
     })();
 
     if let Err(error) = provision_result {
-        for backup in file_backups.into_iter().rev() {
-            let _ = restore_backup(backup);
+        if allow_rollback {
+            for backup in file_backups.into_iter().rev() {
+                let _ = restore_backup(backup);
+            }
+            if let Some(link_backup) = symlink_backup {
+                let _ = restore_symlink(link_backup);
+            }
+            steps.push(StepStatus {
+                name: "rollback".to_string(),
+                status: "ok".to_string(),
+                detail: "restored env/nginx changes after failure".to_string(),
+            });
+        } else {
+            steps.push(StepStatus {
+                name: "rollback".to_string(),
+                status: "skipped".to_string(),
+                detail: "skipped rollback because nginx configuration was not applied".to_string(),
+            });
         }
-        if let Some(link_backup) = symlink_backup {
-            let _ = restore_symlink(link_backup);
-        }
-        steps.push(StepStatus {
-            name: "rollback".to_string(),
-            status: "ok".to_string(),
-            detail: "restored env/nginx changes after failure".to_string(),
-        });
         return Err(error);
     }
 
@@ -558,6 +572,37 @@ fn run_migrations(
         steps,
     )?;
     Ok(())
+}
+
+fn enable_service(
+    cli: &Cli,
+    runtime: &RuntimeContext,
+    steps: &mut Vec<StepStatus>,
+) -> Result<(), ProvisionError> {
+    match cli.service_enable_mode {
+        ServiceEnableMode::None => {
+            steps.push(StepStatus {
+                name: "enable_service".to_string(),
+                status: "skipped".to_string(),
+                detail: "service-enable-mode is none".to_string(),
+            });
+            Ok(())
+        }
+        ServiceEnableMode::Runtime => run_command(
+            "systemctl",
+            &["--runtime", "enable", &runtime.service_name],
+            None,
+            "enable_service",
+            steps,
+        ),
+        ServiceEnableMode::Persistent => run_command(
+            "systemctl",
+            &["enable", &runtime.service_name],
+            None,
+            "enable_service",
+            steps,
+        ),
+    }
 }
 
 fn render_env_file(cli: &Cli, runtime: &RuntimeContext) -> String {
