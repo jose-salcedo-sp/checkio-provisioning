@@ -235,17 +235,18 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         nginx_enabled_symlink: nginx_enabled_symlink.clone(),
     };
 
-    let mut file_backups: Vec<FileBackup> = Vec::new();
+    let mut pre_nginx_backups: Vec<FileBackup> = Vec::new();
+    let mut nginx_backups: Vec<FileBackup> = Vec::new();
     let mut symlink_backup: Option<SymlinkBackup> = None;
     let mut allow_rollback = false;
 
     let provision_result = (|| -> Result<(), ProvisionError> {
         create_directories(&cli, &runtime, steps)?;
-        create_database_file(&runtime, steps)?;
+        create_database_file(&cli, &runtime, steps)?;
         run_migrations(&cli, &runtime, steps)?;
 
         let env_content = render_env_file(&cli, &runtime);
-        file_backups.push(atomic_write_with_backup(
+        pre_nginx_backups.push(atomic_write_with_backup(
             &runtime.env_file,
             env_content.as_bytes(),
         )?);
@@ -280,7 +281,7 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
 
         let nginx_config = render_nginx_config(&runtime);
         allow_rollback = true;
-        file_backups.push(atomic_write_with_backup(
+        nginx_backups.push(atomic_write_with_backup(
             &runtime.nginx_file,
             nginx_config.as_bytes(),
         )?);
@@ -295,13 +296,52 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         });
 
         run_command(&cli.nginx_bin, &["-t"], None, "nginx_validate", steps)?;
-        run_command(
-            "systemctl",
-            &["reload", "nginx"],
-            None,
-            "nginx_reload",
-            steps,
-        )?;
+        {
+            let reload_ok = Command::new("systemctl")
+                .args(["reload", "nginx"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if !reload_ok {
+                let out = Command::new("systemctl")
+                    .args(["restart", "nginx"])
+                    .output()
+                    .map_err(|e| {
+                        ProvisionError::Message(format!("failed to execute systemctl: {e}"))
+                    })?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let detail = if !stderr.is_empty() {
+                        stderr
+                    } else if !stdout.is_empty() {
+                        stdout
+                    } else {
+                        "command failed without output".to_string()
+                    };
+                    steps.push(StepStatus {
+                        name: "nginx_reload".to_string(),
+                        status: "failed".to_string(),
+                        detail: detail.clone(),
+                    });
+                    return Err(ProvisionError::Message(format!(
+                        "nginx_reload failed: {detail}"
+                    )));
+                }
+                steps.push(StepStatus {
+                    name: "nginx_reload".to_string(),
+                    status: "ok".to_string(),
+                    detail: "reload failed, restarted nginx successfully".to_string(),
+                });
+            } else {
+                steps.push(StepStatus {
+                    name: "nginx_reload".to_string(),
+                    status: "ok".to_string(),
+                    detail: "systemctl reload nginx".to_string(),
+                });
+            }
+        }
 
         if cli.skip_certbot {
             steps.push(StepStatus {
@@ -335,14 +375,18 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
             steps,
         )?;
         verify_port_listening(runtime.port, steps)?;
-        verify_https_health(&runtime, &cli.health_path, steps)?;
+        if cli.skip_certbot {
+            verify_http_local_health(runtime.port, &cli.health_path, steps)?;
+        } else {
+            verify_https_health(&runtime, &cli.health_path, steps)?;
+        }
 
         Ok(())
     })();
 
     if let Err(error) = provision_result {
         if allow_rollback {
-            for backup in file_backups.into_iter().rev() {
+            for backup in nginx_backups.into_iter().rev() {
                 let _ = restore_backup(backup);
             }
             if let Some(link_backup) = symlink_backup {
@@ -351,9 +395,11 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
             steps.push(StepStatus {
                 name: "rollback".to_string(),
                 status: "ok".to_string(),
-                detail: "restored env/nginx changes after failure".to_string(),
+                detail: "restored nginx artifacts after failure; env/service state preserved"
+                    .to_string(),
             });
         } else {
+            drop(pre_nginx_backups);
             steps.push(StepStatus {
                 name: "rollback".to_string(),
                 status: "skipped".to_string(),
@@ -528,6 +574,7 @@ fn create_directories(
 }
 
 fn create_database_file(
+    cli: &Cli,
     runtime: &RuntimeContext,
     steps: &mut Vec<StepStatus>,
 ) -> Result<(), ProvisionError> {
@@ -543,6 +590,12 @@ fn create_database_file(
         file.write_all(b"")?;
     }
     set_file_mode(&db_path, 0o640)?;
+    run_chown(
+        &db_path,
+        &format!("{}:{}", cli.service_user, cli.service_user),
+        "chown_database_file",
+        steps,
+    )?;
     steps.push(StepStatus {
         name: "create_database".to_string(),
         status: "ok".to_string(),
@@ -782,6 +835,39 @@ fn verify_port_listening(port: u16, steps: &mut Vec<StepStatus>) -> Result<(), P
         name: "verify_port_listening".to_string(),
         status: "ok".to_string(),
         detail: addr,
+    });
+    Ok(())
+}
+
+fn verify_http_local_health(
+    port: u16,
+    health_path: &str,
+    steps: &mut Vec<StepStatus>,
+) -> Result<(), ProvisionError> {
+    let path = if health_path.starts_with('/') {
+        health_path.to_string()
+    } else {
+        format!("/{health_path}")
+    };
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let response = client.get(&url).send()?;
+    let status = response.status();
+    if status.is_server_error() {
+        steps.push(StepStatus {
+            name: "http_health_check".to_string(),
+            status: "failed".to_string(),
+            detail: format!("{} -> HTTP {}", url, status.as_u16()),
+        });
+        return Err(ProvisionError::Message(format!(
+            "HTTP health check failed with status {}",
+            status
+        )));
+    }
+    steps.push(StepStatus {
+        name: "http_health_check".to_string(),
+        status: "ok".to_string(),
+        detail: format!("{} -> HTTP {}", url, status.as_u16()),
     });
     Ok(())
 }
