@@ -88,6 +88,33 @@ struct Cli {
     /// to serve them at / and proxy /api/ to the backend.
     #[arg(long)]
     frontend_dist: Option<PathBuf>,
+
+    /// Path to a TLS certificate file (PEM). When provided together with
+    /// --tls-key, nginx is configured to serve HTTPS on port 443 with an
+    /// HTTP→HTTPS redirect on port 80. Intended for use with mkcert or
+    /// other pre-generated certificates when --skip-certbot is set.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to the TLS private key file (PEM) matching --tls-cert.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// Seed user: full name (must be provided together with --seed-email and --seed-password).
+    #[arg(long)]
+    seed_name: Option<String>,
+
+    /// Seed user: email address.
+    #[arg(long)]
+    seed_email: Option<String>,
+
+    /// Seed user: plain-text password (hashed with Argon2id before storage).
+    #[arg(long)]
+    seed_password: Option<String>,
+
+    /// Seed user: role assigned to the seed user (default: admin).
+    #[arg(long, default_value = "admin")]
+    seed_role: String,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -198,6 +225,39 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         ));
     }
 
+    match (&cli.seed_name, &cli.seed_email, &cli.seed_password) {
+        (Some(_), Some(_), Some(_)) | (None, None, None) => {}
+        _ => {
+            return Err(ProvisionError::Message(
+                "--seed-name, --seed-email, and --seed-password must all be provided together"
+                    .to_string(),
+            ));
+        }
+    }
+
+    match (&cli.tls_cert, &cli.tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ProvisionError::Message(
+                "--tls-cert and --tls-key must be provided together".to_string(),
+            ));
+        }
+        (Some(cert), Some(key)) => {
+            if !cert.exists() {
+                return Err(ProvisionError::Message(format!(
+                    "tls cert not found: {}",
+                    cert.display()
+                )));
+            }
+            if !key.exists() {
+                return Err(ProvisionError::Message(format!(
+                    "tls key not found: {}",
+                    key.display()
+                )));
+            }
+        }
+        (None, None) => {}
+    }
+
     let domain = cli
         .domain
         .clone()
@@ -254,6 +314,7 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         create_directories(&cli, &runtime, steps)?;
         create_database_file(&cli, &runtime, steps)?;
         run_migrations(&cli, &runtime, steps)?;
+        create_seed_user(&cli, &runtime, steps)?;
 
         let env_content = render_env_file(&cli, &runtime);
         pre_nginx_backups.push(atomic_write_with_backup(
@@ -292,7 +353,8 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
         deploy_frontend(&cli, &runtime, steps)?;
 
         let has_frontend = cli.frontend_dist.is_some();
-        let nginx_config = render_nginx_config(&runtime, has_frontend);
+        let tls = cli.tls_cert.as_ref().zip(cli.tls_key.as_ref());
+        let nginx_config = render_nginx_config(&runtime, has_frontend, tls);
         allow_rollback = true;
         nginx_backups.push(atomic_write_with_backup(
             &runtime.nginx_file,
@@ -388,10 +450,11 @@ fn run(cli: Cli, steps: &mut Vec<StepStatus>) -> Result<ProvisionOutput, Provisi
             steps,
         )?;
         verify_port_listening(runtime.port, steps)?;
-        if cli.skip_certbot {
-            verify_http_local_health(runtime.port, &cli.health_path, steps)?;
-        } else {
+        let has_tls = cli.tls_cert.is_some() || !cli.skip_certbot;
+        if has_tls {
             verify_https_health(&runtime, &cli.health_path, steps)?;
+        } else {
+            verify_http_local_health(runtime.port, &cli.health_path, steps)?;
         }
 
         Ok(())
@@ -674,6 +737,54 @@ fn enable_service(
     }
 }
 
+fn create_seed_user(
+    cli: &Cli,
+    runtime: &RuntimeContext,
+    steps: &mut Vec<StepStatus>,
+) -> Result<(), ProvisionError> {
+    let (name, email, password) = match (
+        cli.seed_name.as_deref(),
+        cli.seed_email.as_deref(),
+        cli.seed_password.as_deref(),
+    ) {
+        (Some(n), Some(e), Some(p)) => (n, e, p),
+        _ => {
+            steps.push(StepStatus {
+                name: "create_seed_user".to_string(),
+                status: "skipped".to_string(),
+                detail: "no seed user flags provided".to_string(),
+            });
+            return Ok(());
+        }
+    };
+
+    use argon2::{
+        Argon2,
+        password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+    };
+
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| ProvisionError::Message(format!("failed to hash password: {e}")))?
+        .to_string();
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let escape = |s: &str| s.replace('\'', "''");
+    let db_path = runtime.database_url.trim_start_matches("sqlite:");
+    let sql = format!(
+        "INSERT INTO users (id, name, email, password_hash, role, is_active) \
+         VALUES ('{}', '{}', '{}', '{}', '{}', 1);",
+        id,
+        escape(name),
+        escape(email),
+        escape(&hash),
+        escape(&cli.seed_role),
+    );
+
+    run_command("sqlite3", &[db_path, &sql], None, "create_seed_user", steps)
+}
+
 fn render_env_file(cli: &Cli, runtime: &RuntimeContext) -> String {
     format!(
         "DATABASE_URL={}\nHOST=0.0.0.0\nPORT={}\nJWT_SECRET={}\nCLIENT_ORIGIN={}\n",
@@ -681,18 +792,50 @@ fn render_env_file(cli: &Cli, runtime: &RuntimeContext) -> String {
     )
 }
 
-fn render_nginx_config(runtime: &RuntimeContext, has_frontend: bool) -> String {
+fn render_nginx_config(
+    runtime: &RuntimeContext,
+    has_frontend: bool,
+    tls: Option<(&PathBuf, &PathBuf)>,
+) -> String {
     let upstream = format!("checkio_{}", runtime.tenant.replace('-', "_"));
-    if has_frontend {
-        format!(
-            "upstream {upstream} {{
-    server 127.0.0.1:{port};
-}}
 
-server {{
+    let listen_block = if let Some((cert, key)) = tls {
+        format!(
+            "    listen 443 ssl;
+    server_name {domain};
+    ssl_certificate {cert};
+    ssl_certificate_key {key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;",
+            domain = runtime.domain,
+            cert = cert.display(),
+            key = key.display(),
+        )
+    } else {
+        format!(
+            "    listen 80;\n    server_name {domain};",
+            domain = runtime.domain
+        )
+    };
+
+    let http_redirect = if tls.is_some() {
+        format!(
+            "server {{
     listen 80;
     server_name {domain};
+    return 301 https://$host$request_uri;
+}}
 
+",
+            domain = runtime.domain
+        )
+    } else {
+        String::new()
+    };
+
+    let locations = if has_frontend {
+        format!(
+            "
     root {public_dir};
     index index.html;
 
@@ -706,38 +849,40 @@ server {{
 
     location / {{
         try_files $uri $uri/ /index.html;
-    }}
-}}
-",
-            upstream = upstream,
-            port = runtime.port,
-            domain = runtime.domain,
+    }}",
             public_dir = runtime.public_dir.display(),
+            upstream = upstream,
         )
     } else {
         format!(
-            "upstream {upstream} {{
-    server 127.0.0.1:{port};
-}}
-
-server {{
-    listen 80;
-    server_name {domain};
-
+            "
     location / {{
         proxy_pass http://{upstream};
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-    }}
+    }}",
+            upstream = upstream,
+        )
+    };
+
+    format!(
+        "upstream {upstream} {{
+    server 127.0.0.1:{port};
+}}
+
+{http_redirect}server {{
+{listen_block}
+{locations}
 }}
 ",
-            upstream = upstream,
-            port = runtime.port,
-            domain = runtime.domain,
-        )
-    }
+        upstream = upstream,
+        port = runtime.port,
+        http_redirect = http_redirect,
+        listen_block = listen_block,
+        locations = locations,
+    )
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), ProvisionError> {
