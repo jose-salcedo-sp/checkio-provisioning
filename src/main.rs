@@ -111,10 +111,6 @@ struct Cli {
     /// Seed user: plain-text password (hashed with Argon2id before storage).
     #[arg(long)]
     seed_password: Option<String>,
-
-    /// Seed user: role assigned to the seed user (default: admin).
-    #[arg(long, default_value = "admin")]
-    seed_role: String,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -773,13 +769,12 @@ fn create_seed_user(
     let escape = |s: &str| s.replace('\'', "''");
     let db_path = runtime.database_url.trim_start_matches("sqlite:");
     let sql = format!(
-        "INSERT INTO users (id, name, email, password_hash, role, is_active) \
-         VALUES ('{}', '{}', '{}', '{}', '{}', 1);",
+        "INSERT INTO users (id, name, email, password_hash, role_id, is_active) \
+         VALUES ('{}', '{}', '{}', '{}', (SELECT id FROM roles WHERE slug = 'admin' LIMIT 1), 1);",
         id,
         escape(name),
         escape(email),
         escape(&hash),
-        escape(&cli.seed_role),
     );
 
     run_command("sqlite3", &[db_path, &sql], None, "create_seed_user", steps)
